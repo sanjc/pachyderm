@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	dbg "runtime/debug"
 	"sync"
 
 	"github.com/gogo/protobuf/types"
@@ -265,6 +266,7 @@ func (c APIClient) inspectCommit(repoName string, commitID string, blockState pf
 		},
 	)
 	if err != nil {
+		dbg.PrintStack()
 		return nil, grpcutil.ScrubGRPC(err)
 	}
 	return commitInfo, nil
