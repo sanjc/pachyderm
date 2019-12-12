@@ -5373,192 +5373,6 @@ func TestUnionInput(t *testing.T) {
 	})
 }
 
-func TestGarbageCollection(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration tests in short mode")
-	}
-
-	c := getPachClient(t)
-
-	// Delete everything, then run garbage collection and finally check that
-	// we're at a baseline of 0 tags and 0 objects.
-	require.NoError(t, c.DeleteAll())
-	require.NoError(t, c.GarbageCollect(0))
-	originalObjects := getAllObjects(t, c)
-	originalTags := getAllTags(t, c)
-	require.Equal(t, 0, len(originalObjects))
-	require.Equal(t, 0, len(originalTags))
-
-	dataRepo := tu.UniqueString(t.Name())
-	pipeline := tu.UniqueString(t.Name() + "Pipeline")
-	failurePipeline := tu.UniqueString(t.Name() + "FailurePipeline")
-
-	var commit *pfs.Commit
-	var err error
-	createInputAndPipeline := func() {
-		require.NoError(t, c.CreateRepo(dataRepo))
-
-		commit, err = c.StartCommit(dataRepo, "master")
-		require.NoError(t, err)
-		_, err = c.PutFile(dataRepo, commit.ID, "foo", strings.NewReader("foo"))
-		require.NoError(t, err)
-		_, err = c.PutFile(dataRepo, commit.ID, "bar", strings.NewReader("bar"))
-		require.NoError(t, err)
-		require.NoError(t, c.FinishCommit(dataRepo, "master"))
-
-		// This pipeline fails immediately (to test that GC succeeds in the
-		// presence of failed pipelines
-		require.NoError(t, c.CreatePipeline(
-			failurePipeline,
-			"nonexistant-image",
-			[]string{"bash"},
-			[]string{"exit 1"},
-			nil,
-			client.NewPFSInput(dataRepo, "/"),
-			"",
-			false,
-		))
-		// This pipeline copies foo and modifies bar
-		require.NoError(t, c.CreatePipeline(
-			pipeline,
-			"",
-			[]string{"bash"},
-			[]string{
-				fmt.Sprintf("cp /pfs/%s/foo /pfs/out/foo", dataRepo),
-				fmt.Sprintf("cp /pfs/%s/bar /pfs/out/bar", dataRepo),
-				"echo bar >> /pfs/out/bar",
-			},
-			nil,
-			client.NewPFSInput(dataRepo, "/"),
-			"",
-			false,
-		))
-		// run FlushJob inside a retry loop, as the pipeline may take a few moments
-		// to start the worker master and create a job
-		require.NoErrorWithinTRetry(t, 61*time.Second, func() error {
-			jobInfos, err := c.FlushJobAll([]*pfs.Commit{commit}, nil)
-			require.NoError(t, err)
-			if len(jobInfos) != 1 {
-				return fmt.Errorf("expected one job but got %d", len(jobInfos))
-			}
-			if jobInfos[0].State != pps.JobState_JOB_SUCCESS {
-				return fmt.Errorf("Expected job in state SUCCESS but was in %s", jobInfos[0].State)
-			}
-			return nil
-		})
-	}
-	createInputAndPipeline()
-
-	objectsBefore := getAllObjects(t, c)
-	tagsBefore := getAllTags(t, c)
-	specObjectCountBefore := getObjectCountForRepo(t, c, ppsconsts.SpecRepo)
-	// Try to GC without stopping the pipeline.
-	require.YesError(t, c.GarbageCollect(0))
-
-	// Now stop the pipeline  and GC
-	require.NoError(t, c.StopPipeline(pipeline))
-	require.NoErrorWithinTRetry(t, 90*time.Second, func() error {
-		return c.GarbageCollect(0)
-	})
-
-	// Check that data still exists in the input repo
-	var buf bytes.Buffer
-	require.NoError(t, c.GetFile(dataRepo, commit.ID, "foo", 0, 0, &buf))
-	require.Equal(t, "foo", buf.String())
-	buf.Reset()
-	require.NoError(t, c.GetFile(dataRepo, commit.ID, "bar", 0, 0, &buf))
-	require.Equal(t, "bar", buf.String())
-
-	pis, err := c.ListPipeline()
-	require.NoError(t, err)
-	require.Equal(t, 2, len(pis))
-
-	buf.Reset()
-	require.NoError(t, c.GetFile(pipeline, "master", "foo", 0, 0, &buf))
-	require.Equal(t, "foo", buf.String())
-	buf.Reset()
-	require.NoError(t, c.GetFile(pipeline, "master", "bar", 0, 0, &buf))
-	require.Equal(t, "barbar\n", buf.String())
-
-	// Check that no objects or tags have been removed, since we just ran GC
-	// without deleting anything.
-	objectsAfter := getAllObjects(t, c)
-	tagsAfter := getAllTags(t, c)
-
-	require.Equal(t, len(tagsBefore), len(tagsAfter))
-	// Stopping the pipeline creates/updates the pipeline __spec__ repo, so we need
-	// to account for the number of objects we added there
-	specObjectCountAfter := getObjectCountForRepo(t, c, ppsconsts.SpecRepo)
-	expectedSpecObjectCountDelta := specObjectCountAfter - specObjectCountBefore
-	require.Equal(t, len(objectsBefore)+expectedSpecObjectCountDelta, len(objectsAfter))
-	objectsBefore = objectsAfter
-	tagsBefore = tagsAfter
-
-	// Now delete both pipelines and GC
-	require.NoError(t, c.DeletePipeline(pipeline, false))
-	require.NoError(t, c.DeletePipeline(failurePipeline, false))
-	require.NoErrorWithinTRetry(t, 30*time.Second, func() error {
-		require.NoError(t, c.GarbageCollect(0))
-
-		// We should've deleted one tag since the functioning pipeline only processed
-		// one datum.
-		tagsAfter = getAllTags(t, c)
-		if dTags := len(tagsBefore) - len(tagsAfter); dTags != 1 {
-			return fmt.Errorf("expected 1 tag after GC but found %d", dTags)
-		}
-
-		// We should've deleted 2 objects:
-		// - the hashtree referenced by the tag (datum hashtree)
-		//   - Note that the hashtree for the output commit is the same object as the
-		//     datum hashtree. It contains the same metadata, and b/c hashtrees are
-		//     stored as objects, it's deduped with the datum hashtree
-		// - The "datums" object attached to 'pipeline's output commit
-		// Note that deleting a pipeline doesn't delete the spec commits
-		objectsAfter = getAllObjects(t, c)
-		if dObjects := len(objectsBefore) - len(objectsAfter); dObjects != 2 {
-			return fmt.Errorf("expected 3 objects but found %d", dObjects)
-		}
-		// The 9 remaining objects are:
-		// - hashtree for input commit
-		// - object w/ contents of /foo + object w/ contents of /bar
-		// - 6 objects in __spec__:
-		//   (hashtree + /spec file) * (2 'pipeline' commits + 1 'failurePipeline' commit)
-		if len(objectsAfter) != 9 {
-			return fmt.Errorf("expected 9 objects remaining, but found %d", len(objectsAfter))
-		}
-		return nil
-	})
-
-	// Now we delete everything.
-	require.NoError(t, c.DeleteAll())
-	require.NoError(t, c.GarbageCollect(0))
-
-	// Since we've now deleted everything that we created in this test,
-	// the tag count and object count should be back to the originals.
-	objectsAfter = getAllObjects(t, c)
-	tagsAfter = getAllTags(t, c)
-	require.Equal(t, 0, len(tagsAfter))
-	require.Equal(t, 0, len(objectsAfter))
-
-	// Now we create the pipeline again and check that all data is
-	// accessible.  This is important because there used to be a bug
-	// where we failed to invalidate the cache such that the objects in
-	// the cache were referencing blocks that had been GC-ed.
-	createInputAndPipeline()
-	buf.Reset()
-	require.NoError(t, c.GetFile(dataRepo, commit.ID, "foo", 0, 0, &buf))
-	require.Equal(t, "foo", buf.String())
-	buf.Reset()
-	require.NoError(t, c.GetFile(dataRepo, commit.ID, "bar", 0, 0, &buf))
-	require.Equal(t, "bar", buf.String())
-	buf.Reset()
-	require.NoError(t, c.GetFile(pipeline, "master", "foo", 0, 0, &buf))
-	require.Equal(t, "foo", buf.String())
-	buf.Reset()
-	require.NoError(t, c.GetFile(pipeline, "master", "bar", 0, 0, &buf))
-	require.Equal(t, "barbar\n", buf.String())
-}
-
 func TestPipelineWithStats(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration tests in short mode")
@@ -7090,6 +6904,192 @@ func TestLongDatums(t *testing.T) {
 		require.NoError(t, c.GetFile(commitInfos[0].Commit.Repo.Name, commitInfos[0].Commit.ID, fmt.Sprintf("file%d", i), 0, 0, &buf))
 		require.Equal(t, "foo", buf.String())
 	}
+}
+
+func TestGarbageCollection(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration tests in short mode")
+	}
+
+	c := getPachClient(t)
+
+	// Delete everything, then run garbage collection and finally check that
+	// we're at a baseline of 0 tags and 0 objects.
+	require.NoError(t, c.DeleteAll())
+	require.NoError(t, c.GarbageCollect(0))
+	originalObjects := getAllObjects(t, c)
+	originalTags := getAllTags(t, c)
+	require.Equal(t, 0, len(originalObjects))
+	require.Equal(t, 0, len(originalTags))
+
+	dataRepo := tu.UniqueString(t.Name())
+	pipeline := tu.UniqueString(t.Name() + "Pipeline")
+	failurePipeline := tu.UniqueString(t.Name() + "FailurePipeline")
+
+	var commit *pfs.Commit
+	var err error
+	createInputAndPipeline := func() {
+		require.NoError(t, c.CreateRepo(dataRepo))
+
+		commit, err = c.StartCommit(dataRepo, "master")
+		require.NoError(t, err)
+		_, err = c.PutFile(dataRepo, commit.ID, "foo", strings.NewReader("foo"))
+		require.NoError(t, err)
+		_, err = c.PutFile(dataRepo, commit.ID, "bar", strings.NewReader("bar"))
+		require.NoError(t, err)
+		require.NoError(t, c.FinishCommit(dataRepo, "master"))
+
+		// This pipeline fails immediately (to test that GC succeeds in the
+		// presence of failed pipelines
+		require.NoError(t, c.CreatePipeline(
+			failurePipeline,
+			"nonexistant-image",
+			[]string{"bash"},
+			[]string{"exit 1"},
+			nil,
+			client.NewPFSInput(dataRepo, "/"),
+			"",
+			false,
+		))
+		// This pipeline copies foo and modifies bar
+		require.NoError(t, c.CreatePipeline(
+			pipeline,
+			"",
+			[]string{"bash"},
+			[]string{
+				fmt.Sprintf("cp /pfs/%s/foo /pfs/out/foo", dataRepo),
+				fmt.Sprintf("cp /pfs/%s/bar /pfs/out/bar", dataRepo),
+				"echo bar >> /pfs/out/bar",
+			},
+			nil,
+			client.NewPFSInput(dataRepo, "/"),
+			"",
+			false,
+		))
+		// run FlushJob inside a retry loop, as the pipeline may take a few moments
+		// to start the worker master and create a job
+		require.NoErrorWithinTRetry(t, 61*time.Second, func() error {
+			jobInfos, err := c.FlushJobAll([]*pfs.Commit{commit}, nil)
+			require.NoError(t, err)
+			if len(jobInfos) != 1 {
+				return fmt.Errorf("expected one job but got %d", len(jobInfos))
+			}
+			if jobInfos[0].State != pps.JobState_JOB_SUCCESS {
+				return fmt.Errorf("Expected job in state SUCCESS but was in %s", jobInfos[0].State)
+			}
+			return nil
+		})
+	}
+	createInputAndPipeline()
+
+	objectsBefore := getAllObjects(t, c)
+	tagsBefore := getAllTags(t, c)
+	specObjectCountBefore := getObjectCountForRepo(t, c, ppsconsts.SpecRepo)
+	// Try to GC without stopping the pipeline.
+	require.YesError(t, c.GarbageCollect(0))
+
+	// Now stop the pipeline  and GC
+	require.NoError(t, c.StopPipeline(pipeline))
+	require.NoErrorWithinTRetry(t, 90*time.Second, func() error {
+		return c.GarbageCollect(0)
+	})
+
+	// Check that data still exists in the input repo
+	var buf bytes.Buffer
+	require.NoError(t, c.GetFile(dataRepo, commit.ID, "foo", 0, 0, &buf))
+	require.Equal(t, "foo", buf.String())
+	buf.Reset()
+	require.NoError(t, c.GetFile(dataRepo, commit.ID, "bar", 0, 0, &buf))
+	require.Equal(t, "bar", buf.String())
+
+	pis, err := c.ListPipeline()
+	require.NoError(t, err)
+	require.Equal(t, 2, len(pis))
+
+	buf.Reset()
+	require.NoError(t, c.GetFile(pipeline, "master", "foo", 0, 0, &buf))
+	require.Equal(t, "foo", buf.String())
+	buf.Reset()
+	require.NoError(t, c.GetFile(pipeline, "master", "bar", 0, 0, &buf))
+	require.Equal(t, "barbar\n", buf.String())
+
+	// Check that no objects or tags have been removed, since we just ran GC
+	// without deleting anything.
+	objectsAfter := getAllObjects(t, c)
+	tagsAfter := getAllTags(t, c)
+
+	require.Equal(t, len(tagsBefore), len(tagsAfter))
+	// Stopping the pipeline creates/updates the pipeline __spec__ repo, so we need
+	// to account for the number of objects we added there
+	specObjectCountAfter := getObjectCountForRepo(t, c, ppsconsts.SpecRepo)
+	expectedSpecObjectCountDelta := specObjectCountAfter - specObjectCountBefore
+	require.Equal(t, len(objectsBefore)+expectedSpecObjectCountDelta, len(objectsAfter))
+	objectsBefore = objectsAfter
+	tagsBefore = tagsAfter
+
+	// Now delete both pipelines and GC
+	require.NoError(t, c.DeletePipeline(pipeline, false))
+	require.NoError(t, c.DeletePipeline(failurePipeline, false))
+	require.NoErrorWithinTRetry(t, 30*time.Second, func() error {
+		require.NoError(t, c.GarbageCollect(0))
+
+		// We should've deleted one tag since the functioning pipeline only processed
+		// one datum.
+		tagsAfter = getAllTags(t, c)
+		if dTags := len(tagsBefore) - len(tagsAfter); dTags != 1 {
+			return fmt.Errorf("expected 1 tag after GC but found %d", dTags)
+		}
+
+		// We should've deleted 2 objects:
+		// - the hashtree referenced by the tag (datum hashtree)
+		//   - Note that the hashtree for the output commit is the same object as the
+		//     datum hashtree. It contains the same metadata, and b/c hashtrees are
+		//     stored as objects, it's deduped with the datum hashtree
+		// - The "datums" object attached to 'pipeline's output commit
+		// Note that deleting a pipeline doesn't delete the spec commits
+		objectsAfter = getAllObjects(t, c)
+		if dObjects := len(objectsBefore) - len(objectsAfter); dObjects != 2 {
+			return fmt.Errorf("expected 3 objects but found %d", dObjects)
+		}
+		// The 9 remaining objects are:
+		// - hashtree for input commit
+		// - object w/ contents of /foo + object w/ contents of /bar
+		// - 6 objects in __spec__:
+		//   (hashtree + /spec file) * (2 'pipeline' commits + 1 'failurePipeline' commit)
+		if len(objectsAfter) != 9 {
+			return fmt.Errorf("expected 9 objects remaining, but found %d", len(objectsAfter))
+		}
+		return nil
+	})
+
+	// Now we delete everything.
+	require.NoError(t, c.DeleteAll())
+	require.NoError(t, c.GarbageCollect(0))
+
+	// Since we've now deleted everything that we created in this test,
+	// the tag count and object count should be back to the originals.
+	objectsAfter = getAllObjects(t, c)
+	tagsAfter = getAllTags(t, c)
+	require.Equal(t, 0, len(tagsAfter))
+	require.Equal(t, 0, len(objectsAfter))
+
+	// Now we create the pipeline again and check that all data is
+	// accessible.  This is important because there used to be a bug
+	// where we failed to invalidate the cache such that the objects in
+	// the cache were referencing blocks that had been GC-ed.
+	createInputAndPipeline()
+	buf.Reset()
+	require.NoError(t, c.GetFile(dataRepo, commit.ID, "foo", 0, 0, &buf))
+	require.Equal(t, "foo", buf.String())
+	buf.Reset()
+	require.NoError(t, c.GetFile(dataRepo, commit.ID, "bar", 0, 0, &buf))
+	require.Equal(t, "bar", buf.String())
+	buf.Reset()
+	require.NoError(t, c.GetFile(pipeline, "master", "foo", 0, 0, &buf))
+	require.Equal(t, "foo", buf.String())
+	buf.Reset()
+	require.NoError(t, c.GetFile(pipeline, "master", "bar", 0, 0, &buf))
+	require.Equal(t, "barbar\n", buf.String())
 }
 
 func TestPipelineWithGitInputInvalidURLs(t *testing.T) {
