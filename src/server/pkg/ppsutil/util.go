@@ -250,7 +250,7 @@ func PipelineReqFromInfo(pipelineInfo *ppsclient.PipelineInfo) *ppsclient.Create
 		SchedulingSpec:   pipelineInfo.SchedulingSpec,
 		DatumTries:       pipelineInfo.DatumTries,
 		Standby:          pipelineInfo.Standby,
-		CustomMetadata:   pipelineInfo.CustomMetadata,
+		Metadata:         pipelineInfo.Metadata,
 	}
 }
 

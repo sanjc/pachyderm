@@ -1957,7 +1957,7 @@ func (a *apiServer) CreatePipeline(ctx context.Context, request *pps.CreatePipel
 		SchedulingSpec:   request.SchedulingSpec,
 		PodSpec:          request.PodSpec,
 		PodPatch:         request.PodPatch,
-		CustomMetadata:   request.CustomMetadata,
+		Metadata:         request.Metadata,
 	}
 	if err := setPipelineDefaults(pipelineInfo); err != nil {
 		return nil, err

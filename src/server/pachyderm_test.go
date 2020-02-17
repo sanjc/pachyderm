@@ -9636,7 +9636,7 @@ func TestSpout(t *testing.T) {
 			c.Ctx(),
 			&pps.CreatePipelineRequest{
 				Pipeline: client.NewPipeline(pipeline),
-				CustomMetadata: &pps.CustomMetadata{
+				Metadata: &pps.Metadata{
 					Annotations: annotations,
 				},
 				Transform: &pps.Transform{

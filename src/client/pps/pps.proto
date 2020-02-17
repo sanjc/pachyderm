@@ -60,7 +60,7 @@ enum JobState {
   JOB_MERGING = 5;
 }
 
-message CustomMetadata {
+message Metadata {
   map<string, string> annotations = 1;
   map<string, string> labels = 2;
 }
@@ -422,7 +422,7 @@ message PipelineInfo {
   SchedulingSpec scheduling_spec = 40;
   string pod_spec = 41;
   string pod_patch = 44;
-  CustomMetadata custom_metadata = 47;
+  Metadata metadata = 47;
 }
 
 message PipelineInfos {
@@ -639,7 +639,7 @@ message CreatePipelineRequest {
   string pod_spec = 30; // deprecated, use pod_patch below
   string pod_patch = 32; // a json patch will be applied to the pipeline's pod_spec before it's created;
   pfs.Commit spec_commit = 34;
-  CustomMetadata custom_metadata = 46;
+  Metadata metadata = 46;
 }
 
 message InspectPipelineRequest {

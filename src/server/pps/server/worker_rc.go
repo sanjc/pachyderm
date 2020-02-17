@@ -451,15 +451,15 @@ func (a *apiServer) getWorkerOptions(ptr *pps.EtcdPipelineInfo, pipelineInfo *pp
 	}
 
 	// add the user's custom metadata (annotations and labels).
-	customMetadata := pipelineInfo.GetCustomMetadata()
-	if customMetadata != nil {
-		for k, v := range customMetadata.Annotations {
+	metadata := pipelineInfo.GetMetadata()
+	if metadata != nil {
+		for k, v := range metadata.Annotations {
 			if annotations[k] == "" {
 				annotations[k] = v
 			}
 		}
 
-		for k, v := range customMetadata.Labels {
+		for k, v := range metadata.Labels {
 			if labels[k] == "" {
 				labels[k] = v
 			}

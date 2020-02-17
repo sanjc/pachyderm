@@ -734,7 +734,7 @@ func (c APIClient) CreatePipelineService(
 		c.Ctx(),
 		&pps.CreatePipelineRequest{
 			Pipeline: NewPipeline(name),
-			CustomMetadata: &pps.CustomMetadata{
+			Metadata: &pps.Metadata{
 				Annotations: annotations,
 			},
 			Transform: &pps.Transform{
